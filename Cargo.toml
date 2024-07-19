@@ -1,0 +1,36 @@
+[package]
+name = "hal_kv"
+version = "0.1.0"
+authors = ["JLer <jlerxky@live.com>"]
+edition = "2021"
+description = "A kv hybrid access layer"
+categories = ["filesystem"]
+keywords = ["kv", "cache", "ttl", "sled", "moka"]
+readme = "README.md"
+repository = "https://github.com/prime-rs/hal_kv"
+license = "Apache-2.0"
+
+[features]
+default = []
+
+[dependencies]
+bytes = "1.6"
+color-eyre = "0.6"
+moka = { version = "0.12", features = ["sync"] }
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+sled = "1.0.0-alpha"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.38", features = ["time", "rt-multi-thread"] }
+serde_json = "1.0"
+
+[lints.rust]
+missing_copy_implementations = "warn"
+missing_debug_implementations = "warn"
+unused_crate_dependencies = "warn"
+unused_extern_crates = "warn"
+
+[lints.clippy]
+missing_const_for_fn = "warn"
