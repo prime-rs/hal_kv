@@ -8,7 +8,7 @@ use moka::sync::SegmentedCache;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sled::{CompareAndSwapSuccess, Db};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 const SEQUENCE_TREE_NAME: &str = "SEQUENCE";
 
@@ -59,19 +59,20 @@ impl Storage {
             .weigher(|k: &String, v: &Bytes| (k.len() + v.len()) as u32)
             .eviction_listener(move |key, value, cause| {
                 debug!(
-                    "Evicted ({:?},{:?}) because {:?} by cache",
+                    "eviction event: ({:?},{:?}) , cause: {:?}",
                     key, value, cause
                 );
                 match cause {
                     RemovalCause::Explicit | RemovalCause::Expired => {
-                        if let Some(real_key) = key.strip_prefix(":/") {
-                            let (tree_name, key) = real_key.split_once('/').unwrap();
+                        if !key.contains("@@/") {
+                            let (tree_name, key) = key.split_once('/').unwrap();
                             let tree = db_clone.lock().open_tree(tree_name).unwrap();
                             tree.remove(key).unwrap();
-                        } else {
-                            db_clone.lock().remove(key.as_str()).unwrap();
+                            debug!(
+                                "Evicted event: ({:?},{:?}) , cause: {:?}",
+                                key, value, cause
+                            );
                         }
-                        debug!("Evicted ({:?},{:?}) because {:?} by db", key, value, cause);
                     }
                     _ => {}
                 }
@@ -106,7 +107,7 @@ impl Storage {
             tree.iter().for_each(|r| {
                 if let Ok((k, v)) = r {
                     let key = String::from_utf8_lossy(&k);
-                    debug!("Recover cache for tree({}): {:?}", tree_name, key);
+                    info!("Recover cache for tree({}): {:?}", tree_name, key);
                     self.cache
                         .insert(ckey(tree_name, &key), Bytes::from(v.to_vec()));
                 }
@@ -160,17 +161,18 @@ impl Storage {
 
 // key in cache
 fn ckey(tree_name: &str, key: &str) -> String {
-    let ckey = format!(":/{}/{}", tree_name, key);
+    let ckey = format!("{}/{}", tree_name, key);
     ckey
 }
 
 // structured data
 impl Storage {
-    pub fn contains_key(&self, tree_name: &str, key: &str) -> bool {
-        if self.cache.contains_key(&ckey(tree_name, key)) {
+    pub fn contains_key(&self, path: &str) -> bool {
+        if self.cache.contains_key(path) {
             return true;
         }
 
+        let (tree_name, key) = path.split_once('/').unwrap();
         let tree = self.db.open_tree(tree_name).unwrap();
         if let Ok(r) = tree.contains_key(key) {
             return r;
@@ -179,11 +181,13 @@ impl Storage {
         false
     }
 
-    pub fn get(&self, tree_name: &str, key: &str) -> Option<Bytes> {
-        if let Some(v) = self.cache.get(&ckey(tree_name, key)) {
+    pub fn get(&self, path: &str) -> Option<Bytes> {
+        if let Some(v) = self.cache.get(path) {
             return Some(v);
         }
 
+        let (tree_name, key) = path.split_once('/').unwrap();
+        debug!("tree_name: {:?}, key: {:?}", tree_name, key);
         let tree = self.db.open_tree(tree_name).unwrap();
         if let Ok(Some(v)) = tree.get(key) {
             let value = Bytes::from(v.to_vec());
@@ -194,27 +198,45 @@ impl Storage {
         None
     }
 
-    pub fn insert(&self, tree_name: &str, key: &str, value: Vec<u8>) -> Option<Bytes> {
-        let tree = self.db.open_tree(tree_name).unwrap();
-        tree.insert(key, value.clone()).unwrap();
+    pub fn insert(&self, path: &str, value: Vec<u8>) -> Result<Bytes> {
+        let (tree_name, key) = path.split_once('/').unwrap();
+        debug!("tree_name: {:?}, key: {:?}", tree_name, key);
+        let tree = self.db.open_tree(tree_name)?;
+        tree.insert(key, value.clone())?;
         let value = Bytes::from(value);
         self.cache.insert(ckey(tree_name, key), value.clone());
-        Some(value)
+        Ok(value)
     }
 
-    pub fn remove(&self, tree_name: &str, key: &str) {
+    pub fn batch(&self, dir_path: &str, kvs: Vec<(String, Option<Vec<u8>>)>) -> Result<()> {
+        let (tree_name, prefix) = dir_path.split_once('/').unwrap();
+        debug!("tree_name: {:?}, prefix: {:?}", tree_name, prefix);
+        let tree = self.db.open_tree(tree_name)?;
+        let mut batch = sled::Batch::default();
+        for (k, v) in kvs {
+            let k = &format!("{}/{}", prefix, k);
+            if let Some(v) = v {
+                batch.insert(k.clone(), v.clone());
+                let value = Bytes::from(v);
+                self.cache.insert(ckey(tree_name, k), value);
+            } else {
+                self.cache.remove(&ckey(tree_name, k));
+                batch.remove(k);
+            }
+        }
+        tree.apply_batch(batch)?;
+        Ok(())
+    }
+
+    pub fn remove(&self, path: &str) {
+        let (tree_name, key) = path.split_once('/').unwrap();
         let tree = self.db.open_tree(tree_name).unwrap();
         tree.remove(key).unwrap();
         self.cache.remove(&ckey(tree_name, key));
     }
 
-    pub fn cas(
-        &self,
-        tree_name: &str,
-        key: &str,
-        old: Option<Vec<u8>>,
-        new: Option<Vec<u8>>,
-    ) -> Result<()> {
+    pub fn cas(&self, path: &str, old: Option<Vec<u8>>, new: Option<Vec<u8>>) -> Result<()> {
+        let (tree_name, key) = path.split_once('/').unwrap();
         let tree = self.db.open_tree(tree_name)?;
         let cas_result = tree.compare_and_swap(key, old, new);
         match cas_result {
@@ -232,6 +254,47 @@ impl Storage {
             }
         }
         Ok(())
+    }
+
+    pub fn scan(&self, path: &str, max_num: usize) -> Vec<(String, Bytes)> {
+        let (tree_name, prefix) = path.split_once('/').unwrap();
+        debug!("tree_name: {:?}, prefix: {:?}", tree_name, prefix);
+        let tree = self.db.open_tree(tree_name).unwrap();
+        let mut scan = tree.scan_prefix(prefix);
+        let mut r = vec![];
+        for _ in 0..max_num {
+            match scan.next() {
+                Some(Ok((k, v))) => r.push((
+                    String::from_utf8_lossy(&k).to_string(),
+                    Bytes::from(v.to_vec()),
+                )),
+                Some(Err(e)) => {
+                    warn!("sled scan error: {:?}", e);
+                    break;
+                }
+                _ => break,
+            }
+        }
+        r
+    }
+
+    pub fn scan_key(&self, path: &str, max_num: usize) -> Vec<String> {
+        let (tree_name, prefix) = path.split_once('/').unwrap();
+        debug!("tree_name: {:?}, prefix: {:?}", tree_name, prefix);
+        let tree = self.db.open_tree(tree_name).unwrap();
+        let mut scan = tree.scan_prefix(prefix);
+        let mut r = vec![];
+        for _ in 0..max_num {
+            match scan.next() {
+                Some(Ok((k, _))) => r.push(String::from_utf8_lossy(&k).to_string()),
+                Some(Err(e)) => {
+                    warn!("sled scan error: {:?}", e);
+                    break;
+                }
+                _ => break,
+            }
+        }
+        r
     }
 }
 
@@ -305,10 +368,10 @@ fn structured() {
         b: "test".to_string(),
     };
     let bytes = serde_json::to_vec(&test).unwrap();
-    store.insert("tree_name", "test", bytes);
-    let test_db = store.get("tree_name", "test").unwrap();
+    store.insert("tree_name/test", bytes).ok();
+    let test_db = store.get("tree_name/test").unwrap_or_default();
     let test_db = serde_json::from_slice::<Test>(&test_db).unwrap();
     assert_eq!(test, test_db);
-    store.remove("tree_name", "test");
-    assert_eq!(None, store.get("tree_name", "test"));
+    store.remove("tree_name/test");
+    assert_eq!(None, store.get("tree_name/test"));
 }
