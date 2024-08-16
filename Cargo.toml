@@ -17,9 +17,8 @@ default = []
 bytes = "1.6"
 color-eyre = "0.6"
 moka = { version = "0.12", features = ["sync"] }
-parking_lot = "0.12"
 serde = { version = "1.0", features = ["derive"] }
-sled = "1.0.0-alpha"
+redb = "2.1"
 tracing = "0.1"
 
 [dev-dependencies]
@@ -29,8 +28,12 @@ serde_json = "1.0"
 [lints.rust]
 missing_copy_implementations = "warn"
 missing_debug_implementations = "warn"
-unused_crate_dependencies = "warn"
+# unused_crate_dependencies = "warn"
 unused_extern_crates = "warn"
 
 [lints.clippy]
 missing_const_for_fn = "warn"
+
+[[example]]
+name = "eviction"
+path = "examples/eviction.rs"

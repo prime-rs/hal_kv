@@ -5,12 +5,11 @@ use bytes::Bytes;
 use color_eyre::eyre::{eyre, Result};
 use moka::notification::RemovalCause;
 use moka::sync::SegmentedCache;
-use parking_lot::Mutex;
+use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use sled::{CompareAndSwapSuccess, Db};
 use tracing::{debug, info, warn};
 
-const SEQUENCE_TREE_NAME: &str = "SEQUENCE";
+const SEQUENCE_TABLE_NAME: &str = "SEQUENCE";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -37,7 +36,7 @@ impl Default for StorageConfig {
 #[derive(Debug, Clone)]
 pub struct Storage {
     cache: SegmentedCache<String, Bytes>,
-    db: Db,
+    db: Arc<Database>,
 }
 
 unsafe impl Send for Storage {}
@@ -52,8 +51,8 @@ impl Default for Storage {
 
 impl Storage {
     pub fn new(config: &StorageConfig) -> Self {
-        let db = sled::open(&config.db_path).unwrap();
-        let db_clone = Arc::new(Mutex::new(db.clone()));
+        let db = Arc::new(Database::create(&config.db_path).unwrap());
+        let db_clone = db.clone();
 
         let mut builder = SegmentedCache::builder(config.cache_num_segments)
             .weigher(|k: &String, v: &Bytes| (k.len() + v.len()) as u32)
@@ -65,9 +64,15 @@ impl Storage {
                 match cause {
                     RemovalCause::Explicit | RemovalCause::Expired => {
                         if !key.contains("@@/") {
-                            let (tree_name, key) = key.split_once('/').unwrap();
-                            let tree = db_clone.lock().open_tree(tree_name).unwrap();
-                            tree.remove(key).unwrap();
+                            let (table_name, key) = key.split_once('/').unwrap();
+                            let write_txn = db_clone.begin_write().unwrap();
+                            {
+                                let mut table = write_txn
+                                    .open_table(TableDefinition::<&str, Vec<u8>>::new(table_name))
+                                    .unwrap();
+                                table.remove(key).unwrap();
+                            }
+                            write_txn.commit().unwrap();
                             debug!(
                                 "Evicted event: ({:?},{:?}) , cause: {:?}",
                                 key, value, cause
@@ -92,76 +97,65 @@ impl Storage {
         Self { cache, db }
     }
 
-    pub fn recover_root(&self) {
-        self.db.iter().for_each(|r| {
-            if let Ok((k, v)) = r {
-                let key = String::from_utf8_lossy(&k).to_string();
-                debug!("Recover cache for root: {:?}", key);
-                self.cache.insert(key, Bytes::from(v.to_vec()));
+    pub fn recover(&self, table_name: &str) {
+        let read_txn = self.db.begin_read().unwrap();
+        if let Ok(table) = read_txn.open_table(TableDefinition::<&str, Vec<u8>>::new(table_name)) {
+            let mut range = table.range::<&str>(..).unwrap();
+            while let Some(Ok((k, v))) = range.next() {
+                let k = k.value();
+                let v = v.value();
+                info!("Recover cache for table({}): {:?}", table_name, k);
+                self.cache.insert(ckey(table_name, k), Bytes::from(v));
             }
-        });
-    }
-
-    pub fn recover(&self, tree_name: &str) {
-        if let Ok(tree) = self.db.open_tree(tree_name) {
-            tree.iter().for_each(|r| {
-                if let Ok((k, v)) = r {
-                    let key = String::from_utf8_lossy(&k);
-                    info!("Recover cache for tree({}): {:?}", tree_name, key);
-                    self.cache
-                        .insert(ckey(tree_name, &key), Bytes::from(v.to_vec()));
-                }
-            });
         }
     }
 
     pub fn run_pending_tasks(&self) {
         self.cache.run_pending_tasks();
-        self.db.flush().unwrap();
     }
 }
 
 // SEQUENCE
 impl Storage {
     pub fn next(&self, name: &str) -> u32 {
-        let tree = self.db.open_tree(SEQUENCE_TREE_NAME).unwrap();
-        match tree.get(name).ok().and_then(|v| {
-            v.and_then(|v| match v.to_vec().try_into() {
-                Ok(v) => Some(u32::from_be_bytes(v)),
-                Err(_) => None,
-            })
-        }) {
-            Some(next) => {
-                if tree.insert(name, (next + 1).to_be_bytes().to_vec()).is_ok() {
-                    next + 1
-                } else {
-                    0
-                }
+        let write_txn = self.db.begin_write().unwrap();
+        let next = {
+            let mut table = write_txn
+                .open_table(TableDefinition::<&str, u32>::new(SEQUENCE_TABLE_NAME))
+                .unwrap();
+            let next = match table.get(name) {
+                Ok(Some(current)) => current.value() + 1,
+                _ => 1,
+            };
+            if table.insert(name, next).is_ok() {
+                next
+            } else {
+                0
             }
-            None => {
-                if tree.insert(name, 1u32.to_be_bytes().to_vec()).is_ok() {
-                    1
-                } else {
-                    0
-                }
-            }
-        }
+        };
+        write_txn.commit().unwrap();
+        next
     }
 
     pub fn current(&self, name: &str) -> u32 {
-        let tree = self.db.open_tree(SEQUENCE_TREE_NAME).unwrap();
-        if let Ok(Some(v)) = tree.get(name) {
-            if let Ok(v) = v.to_vec().try_into() {
-                return u32::from_be_bytes(v);
+        let read_txn = self.db.begin_read().unwrap();
+        if let Ok(table) =
+            read_txn.open_table(TableDefinition::<&str, u32>::new(SEQUENCE_TABLE_NAME))
+        {
+            if let Ok(Some(v)) = table.get(name) {
+                v.value()
+            } else {
+                0
             }
+        } else {
+            0
         }
-        0
     }
 }
 
 // key in cache
-fn ckey(tree_name: &str, key: &str) -> String {
-    let ckey = format!("{}/{}", tree_name, key);
+fn ckey(table_name: &str, key: &str) -> String {
+    let ckey = format!("{}/{}", table_name, key);
     ckey
 }
 
@@ -172,13 +166,14 @@ impl Storage {
             return true;
         }
 
-        let (tree_name, key) = path.split_once('/').unwrap();
-        let tree = self.db.open_tree(tree_name).unwrap();
-        if let Ok(r) = tree.contains_key(key) {
-            return r;
-        }
+        let (table_name, key) = path.split_once('/').unwrap();
 
-        false
+        let read_txn = self.db.begin_read().unwrap();
+        if let Ok(table) = read_txn.open_table(TableDefinition::<&str, Vec<u8>>::new(table_name)) {
+            matches!(table.get(key), Ok(Some(_)))
+        } else {
+            false
+        }
     }
 
     pub fn get(&self, path: &str) -> Option<Bytes> {
@@ -186,88 +181,135 @@ impl Storage {
             return Some(v);
         }
 
-        let (tree_name, key) = path.split_once('/').unwrap();
-        debug!("tree_name: {:?}, key: {:?}", tree_name, key);
-        let tree = self.db.open_tree(tree_name).unwrap();
-        if let Ok(Some(v)) = tree.get(key) {
-            let value = Bytes::from(v.to_vec());
-            self.cache.insert(ckey(tree_name, key), value.clone());
-            return Some(value);
+        let (table_name, key) = path.split_once('/').unwrap();
+        debug!("table_name: {:?}, key: {:?}", table_name, key);
+
+        let read_txn = self.db.begin_read().unwrap();
+        if let Ok(table) = read_txn.open_table(TableDefinition::<&str, Vec<u8>>::new(table_name)) {
+            if let Ok(Some(v)) = table.get(key) {
+                let value = Bytes::from(v.value());
+                self.cache.insert(ckey(table_name, key), value.clone());
+                return Some(value);
+            }
         }
 
         None
     }
 
     pub fn insert(&self, path: &str, value: Vec<u8>) -> Result<Bytes> {
-        let (tree_name, key) = path.split_once('/').unwrap();
-        debug!("tree_name: {:?}, key: {:?}", tree_name, key);
-        let tree = self.db.open_tree(tree_name)?;
-        tree.insert(key, value.clone())?;
+        let (table_name, key) = path.split_once('/').unwrap();
+        println!("table_name: {:?}, key: {:?}", table_name, key);
+
+        let write_txn = self.db.begin_write().unwrap();
+        {
+            let mut table =
+                write_txn.open_table(TableDefinition::<&str, Vec<u8>>::new(table_name))?;
+            table.insert(key, value.clone())?;
+        }
+        write_txn.commit()?;
         let value = Bytes::from(value);
-        self.cache.insert(ckey(tree_name, key), value.clone());
+        self.cache.insert(ckey(table_name, key), value.clone());
         Ok(value)
     }
 
     pub fn batch(&self, dir_path: &str, kvs: Vec<(String, Option<Vec<u8>>)>) -> Result<()> {
-        let (tree_name, prefix) = dir_path.split_once('/').unwrap();
-        debug!("tree_name: {:?}, prefix: {:?}", tree_name, prefix);
-        let tree = self.db.open_tree(tree_name)?;
-        let mut batch = sled::Batch::default();
-        for (k, v) in kvs {
-            let k = &format!("{}/{}", prefix, k);
-            if let Some(v) = v {
-                batch.insert(k.clone(), v.clone());
-                let value = Bytes::from(v);
-                self.cache.insert(ckey(tree_name, k), value);
-            } else {
-                self.cache.remove(&ckey(tree_name, k));
-                batch.remove(k);
+        let (table_name, prefix) = dir_path.split_once('/').unwrap();
+        info!("table_name: {:?}, prefix: {:?}", table_name, prefix);
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table =
+                write_txn.open_table(TableDefinition::<&str, Vec<u8>>::new(table_name))?;
+
+            for (k, v) in kvs {
+                info!("0");
+                let k = &format!("{}/{}", prefix, k);
+                if let Some(v) = v {
+                    info!("2");
+                    table.insert(k.as_str(), v.clone())?;
+                    let value = Bytes::from(v);
+                    self.cache.insert(ckey(table_name, k), value);
+                } else {
+                    info!("3");
+                    table.remove(k.as_str())?;
+                    info!("5");
+                    self.cache.invalidate(&ckey(table_name, k));
+                    info!("6");
+                }
             }
         }
-        tree.apply_batch(batch)?;
+        info!("1");
+        write_txn.commit()?;
+        info!("4");
         Ok(())
     }
 
     pub fn remove(&self, path: &str) {
-        let (tree_name, key) = path.split_once('/').unwrap();
-        let tree = self.db.open_tree(tree_name).unwrap();
-        tree.remove(key).unwrap();
-        self.cache.remove(&ckey(tree_name, key));
+        let (table_name, key) = path.split_once('/').unwrap();
+
+        let write_txn = self.db.begin_write().unwrap();
+        {
+            let mut table = write_txn
+                .open_table(TableDefinition::<&str, Vec<u8>>::new(table_name))
+                .unwrap();
+            table.remove(key).unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        self.cache.invalidate(&ckey(table_name, key));
     }
 
     pub fn cas(&self, path: &str, old: Option<Vec<u8>>, new: Option<Vec<u8>>) -> Result<()> {
-        let (tree_name, key) = path.split_once('/').unwrap();
-        let tree = self.db.open_tree(tree_name)?;
-        let cas_result = tree.compare_and_swap(key, old, new);
-        match cas_result {
-            Ok(Ok(CompareAndSwapSuccess { new_value, .. })) => match new_value {
-                Some(new) => {
-                    self.cache
-                        .insert(ckey(tree_name, key), Bytes::from(new.to_vec()));
-                }
-                None => {
-                    self.cache.remove(&ckey(tree_name, key));
-                }
-            },
-            _ => {
+        let (table_name, key) = path.split_once('/').unwrap();
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table =
+                write_txn.open_table(TableDefinition::<&str, Vec<u8>>::new(table_name))?;
+            let r = if let Ok(current) = table.get(key) {
+                current.map(|v| v.value()) == old
+            } else {
                 return Err(eyre!("cas failed"));
+            };
+            if r {
+                match new {
+                    Some(new) => {
+                        table.insert(key, new.clone())?;
+                        self.cache
+                            .insert(ckey(table_name, key), Bytes::from(new.to_vec()));
+                    }
+                    None => {
+                        table.remove(key)?;
+                        self.cache.invalidate(&ckey(table_name, key));
+                    }
+                }
             }
         }
+        write_txn.commit()?;
+
         Ok(())
     }
 
     pub fn scan(&self, path: &str, max_num: usize) -> Vec<(String, Bytes)> {
-        let (tree_name, prefix) = path.split_once('/').unwrap();
-        debug!("tree_name: {:?}, prefix: {:?}", tree_name, prefix);
-        let tree = self.db.open_tree(tree_name).unwrap();
-        let mut scan = tree.scan_prefix(prefix);
+        let (table_name, prefix) = path.split_once('/').unwrap();
+        info!("scan table_name: {:?}, prefix: {:?}", table_name, prefix);
+
+        let read_txn = self.db.begin_read().unwrap();
+        let table = read_txn
+            .open_table(TableDefinition::<&str, Vec<u8>>::new(table_name))
+            .unwrap();
+        let mut scan = table.range(prefix..).unwrap();
         let mut r = vec![];
         for _ in 0..max_num {
             match scan.next() {
-                Some(Ok((k, v))) => r.push((
-                    String::from_utf8_lossy(&k).to_string(),
-                    Bytes::from(v.to_vec()),
-                )),
+                Some(Ok((k, v))) => {
+                    let k = k.value();
+                    if k.starts_with(prefix) {
+                        r.push((k.to_string(), Bytes::from(v.value())));
+                    } else {
+                        break;
+                    }
+                }
                 Some(Err(e)) => {
                     warn!("sled scan error: {:?}", e);
                     break;
@@ -279,19 +321,32 @@ impl Storage {
     }
 
     pub fn scan_key(&self, path: &str, max_num: usize) -> Vec<String> {
-        let (tree_name, prefix) = path.split_once('/').unwrap();
-        debug!("tree_name: {:?}, prefix: {:?}", tree_name, prefix);
-        let tree = self.db.open_tree(tree_name).unwrap();
-        let mut scan = tree.scan_prefix(prefix);
+        let (table_name, prefix) = path.split_once('/').unwrap();
+        info!(
+            "scan_key table_name: {:?}, prefix: {:?}",
+            table_name, prefix
+        );
+
+        let read_txn = self.db.begin_read().unwrap();
         let mut r = vec![];
-        for _ in 0..max_num {
-            match scan.next() {
-                Some(Ok((k, _))) => r.push(String::from_utf8_lossy(&k).to_string()),
-                Some(Err(e)) => {
-                    warn!("sled scan error: {:?}", e);
-                    break;
+        if let Ok(table) = read_txn.open_table(TableDefinition::<&str, Vec<u8>>::new(table_name)) {
+            let mut scan = table.range(prefix..).unwrap();
+            for _ in 0..max_num {
+                match scan.next() {
+                    Some(Ok((k, _))) => {
+                        let k = k.value();
+                        if k.starts_with(prefix) {
+                            r.push(k.to_string());
+                        } else {
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        warn!("sled scan error: {:?}", e);
+                        break;
+                    }
+                    _ => break,
                 }
-                _ => break,
             }
         }
         r
@@ -325,26 +380,26 @@ fn eviction() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.spawn(async move {
         for i in 0..10000u32 {
+            println!("insert: {}", i);
             store_clone
-                .cache
-                .insert(i.to_string(), Bytes::from(i.to_string()));
-            store_clone
-                .db
-                .insert(i.to_string(), i.to_string().as_bytes())
+                .insert(
+                    format!("test/{}", i).as_str(),
+                    i.to_string().as_bytes().to_vec(),
+                )
                 .unwrap();
         }
 
         println!("{:?}", store_clone.cache.get(&9999u32.to_string()));
-        println!("{:?}", store_clone.db.get(9999u32.to_string()));
+        println!("{:?}", store_clone.get(&9999u32.to_string()));
         tokio::time::sleep(Duration::from_millis(700)).await;
         println!("{:?}", store.cache.get(&9999u32.to_string()));
-        println!("{:?}", store.db.get(9999u32.to_string()));
+        println!("{:?}", store.get(&9999u32.to_string()));
         tokio::time::sleep(Duration::from_millis(300)).await;
         println!("{:?}", store.cache.get(&9999u32.to_string()));
-        println!("{:?}", store.db.get(9999u32.to_string()));
+        println!("{:?}", store.get(&9999u32.to_string()));
         tokio::time::sleep(Duration::from_millis(10)).await;
         println!("{:?}", store.cache.get(&9999u32.to_string()));
-        println!("{:?}", store.db.get(9999u32.to_string()));
+        println!("{:?}", store.get(&9999u32.to_string()));
     });
     rt.block_on(async {
         tokio::time::sleep(Duration::from_millis(2000)).await;
@@ -368,10 +423,10 @@ fn structured() {
         b: "test".to_string(),
     };
     let bytes = serde_json::to_vec(&test).unwrap();
-    store.insert("tree_name/test", bytes).ok();
-    let test_db = store.get("tree_name/test").unwrap_or_default();
+    store.insert("table_name/test", bytes).ok();
+    let test_db = store.get("table_name/test").unwrap_or_default();
     let test_db = serde_json::from_slice::<Test>(&test_db).unwrap();
     assert_eq!(test, test_db);
-    store.remove("tree_name/test");
-    assert_eq!(None, store.get("tree_name/test"));
+    store.remove("table_name/test");
+    assert_eq!(None, store.get("table_name/test"));
 }
