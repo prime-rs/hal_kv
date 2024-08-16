@@ -61,25 +61,20 @@ impl Storage {
                     "eviction event: ({:?},{:?}) , cause: {:?}",
                     key, value, cause
                 );
-                match cause {
-                    RemovalCause::Explicit | RemovalCause::Expired => {
-                        if !key.contains("@@/") {
-                            let (table_name, key) = key.split_once('/').unwrap();
-                            let write_txn = db_clone.begin_write().unwrap();
-                            {
-                                let mut table = write_txn
-                                    .open_table(TableDefinition::<&str, Vec<u8>>::new(table_name))
-                                    .unwrap();
-                                table.remove(key).unwrap();
-                            }
-                            write_txn.commit().unwrap();
-                            debug!(
-                                "Evicted event: ({:?},{:?}) , cause: {:?}",
-                                key, value, cause
-                            );
-                        }
+                if cause == RemovalCause::Expired && !key.contains("@@/") {
+                    let (table_name, key) = key.split_once('/').unwrap();
+                    let write_txn = db_clone.begin_write().unwrap();
+                    {
+                        let mut table = write_txn
+                            .open_table(TableDefinition::<&str, Vec<u8>>::new(table_name))
+                            .unwrap();
+                        table.remove(key).unwrap();
                     }
-                    _ => {}
+                    write_txn.commit().unwrap();
+                    debug!(
+                        "Evicted event: ({:?},{:?}) , cause: {:?}",
+                        key, value, cause
+                    );
                 }
             });
         if let Some(v) = config.cache_max_capacity {
@@ -198,7 +193,7 @@ impl Storage {
 
     pub fn insert(&self, path: &str, value: Vec<u8>) -> Result<Bytes> {
         let (table_name, key) = path.split_once('/').unwrap();
-        println!("table_name: {:?}, key: {:?}", table_name, key);
+        debug!("table_name: {:?}, key: {:?}", table_name, key);
 
         let write_txn = self.db.begin_write().unwrap();
         {
@@ -214,7 +209,7 @@ impl Storage {
 
     pub fn batch(&self, dir_path: &str, kvs: Vec<(String, Option<Vec<u8>>)>) -> Result<()> {
         let (table_name, prefix) = dir_path.split_once('/').unwrap();
-        info!("table_name: {:?}, prefix: {:?}", table_name, prefix);
+        debug!("table_name: {:?}, prefix: {:?}", table_name, prefix);
 
         let write_txn = self.db.begin_write()?;
         {
@@ -222,25 +217,18 @@ impl Storage {
                 write_txn.open_table(TableDefinition::<&str, Vec<u8>>::new(table_name))?;
 
             for (k, v) in kvs {
-                info!("0");
                 let k = &format!("{}/{}", prefix, k);
                 if let Some(v) = v {
-                    info!("2");
                     table.insert(k.as_str(), v.clone())?;
                     let value = Bytes::from(v);
                     self.cache.insert(ckey(table_name, k), value);
                 } else {
-                    info!("3");
                     table.remove(k.as_str())?;
-                    info!("5");
                     self.cache.invalidate(&ckey(table_name, k));
-                    info!("6");
                 }
             }
         }
-        info!("1");
         write_txn.commit()?;
-        info!("4");
         Ok(())
     }
 
@@ -292,7 +280,7 @@ impl Storage {
 
     pub fn scan(&self, path: &str, max_num: usize) -> Vec<(String, Bytes)> {
         let (table_name, prefix) = path.split_once('/').unwrap();
-        info!("scan table_name: {:?}, prefix: {:?}", table_name, prefix);
+        debug!("scan table_name: {:?}, prefix: {:?}", table_name, prefix);
 
         let read_txn = self.db.begin_read().unwrap();
         let table = read_txn
@@ -322,7 +310,7 @@ impl Storage {
 
     pub fn scan_key(&self, path: &str, max_num: usize) -> Vec<String> {
         let (table_name, prefix) = path.split_once('/').unwrap();
-        info!(
+        debug!(
             "scan_key table_name: {:?}, prefix: {:?}",
             table_name, prefix
         );
