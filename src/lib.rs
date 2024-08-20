@@ -1,3 +1,4 @@
+use std::ops::Bound;
 use std::time::Duration;
 use std::{fmt::Debug, sync::Arc};
 
@@ -5,8 +6,9 @@ use bytes::Bytes;
 use color_eyre::eyre::{eyre, Result};
 use moka::notification::RemovalCause;
 use moka::sync::SegmentedCache;
-use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use tonbo::executor::tokio::TokioExecutor;
+use tonbo::{tonbo_record, DB};
 use tracing::{debug, info, warn};
 
 const SEQUENCE_TABLE_NAME: &str = "SEQUENCE";
@@ -33,25 +35,28 @@ impl Default for StorageConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Storage {
     cache: SegmentedCache<String, Bytes>,
-    db: Arc<Database>,
+    db: Arc<DB<Record, TokioExecutor>>,
 }
 
 unsafe impl Send for Storage {}
 unsafe impl Sync for Storage {}
 
-impl Default for Storage {
-    fn default() -> Self {
-        // By default, This cache will hold up to 1GiB of values.
-        Self::new(&StorageConfig::default())
-    }
+#[tonbo_record]
+pub struct Record {
+    #[primary_key]
+    key: String,
+    value: String,
 }
 
 impl Storage {
-    pub fn new(config: &StorageConfig) -> Self {
-        let db = Arc::new(Database::create(&config.db_path).unwrap());
+    pub async fn new(config: &StorageConfig) -> Self {
+        let db = DB::new(config.db_path.clone().into(), TokioExecutor::default())
+            .await
+            .unwrap();
+        let db = Arc::new(db);
         let db_clone = db.clone();
 
         let mut builder = SegmentedCache::builder(config.cache_num_segments)
@@ -62,15 +67,11 @@ impl Storage {
                     key, value, cause
                 );
                 if cause == RemovalCause::Expired && !key.contains("@@/") {
-                    let (table_name, key) = key.split_once('/').unwrap();
-                    let write_txn = db_clone.begin_write().unwrap();
-                    {
-                        let mut table = write_txn
-                            .open_table(TableDefinition::<&str, Vec<u8>>::new(table_name))
-                            .unwrap();
-                        table.remove(key).unwrap();
-                    }
-                    write_txn.commit().unwrap();
+                    let key_ = key.to_string();
+                    let db_clone = db_clone.clone();
+                    tokio::spawn(async move {
+                        db_clone.remove(key_).await.ok();
+                    });
                     debug!(
                         "Evicted event: ({:?},{:?}) , cause: {:?}",
                         key, value, cause
@@ -92,16 +93,25 @@ impl Storage {
         Self { cache, db }
     }
 
-    pub fn recover(&self, table_name: &str) {
-        let read_txn = self.db.begin_read().unwrap();
-        if let Ok(table) = read_txn.open_table(TableDefinition::<&str, Vec<u8>>::new(table_name)) {
-            let mut range = table.range::<&str>(..).unwrap();
-            while let Some(Ok((k, v))) = range.next() {
-                let k = k.value();
-                let v = v.value();
-                info!("Recover cache for table({}): {:?}", table_name, k);
-                self.cache.insert(ckey(table_name, k), Bytes::from(v));
-            }
+    pub async fn recover(&self, table_name: &str) {
+        let mut range = self
+            .db
+            .scan(
+                (Bound::Included(&"".into()), Bound::Excluded(&"".into())),
+                |_| {},
+            )
+            .await
+            .projection(vec![1])
+            // push down limitation
+            .limit(1)
+            .take()
+            .await
+            .unwrap();
+        while let Some(Ok((k, v))) = range.next() {
+            let k = k.value();
+            let v = v.value();
+            info!("Recover cache for table({}): {:?}", table_name, k);
+            self.cache.insert(ckey(table_name, k), Bytes::from(v));
         }
     }
 
