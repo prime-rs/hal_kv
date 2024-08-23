@@ -19,6 +19,7 @@ pub struct StorageConfig {
     pub cache_max_capacity: Option<u64>,
     pub cache_time_to_live: Option<u64>,
     pub cache_time_to_idle: Option<u64>,
+    pub recover_table_vec: Vec<String>,
 }
 
 impl Default for StorageConfig {
@@ -29,6 +30,7 @@ impl Default for StorageConfig {
             cache_max_capacity: None,
             cache_time_to_live: None,
             cache_time_to_idle: None,
+            recover_table_vec: vec![],
         }
     }
 }
@@ -62,7 +64,7 @@ impl Storage {
                     key, value, cause
                 );
                 if cause == RemovalCause::Expired && !key.contains("@@/") {
-                    let (table_name, key) = key.split_once('/').unwrap();
+                    let (table_name, key) = key.split_once('/').unwrap_or(("DEFAULT", &key));
                     let write_txn = db_clone.begin_write().unwrap();
                     {
                         let mut table = write_txn
@@ -161,7 +163,7 @@ impl Storage {
             return true;
         }
 
-        let (table_name, key) = path.split_once('/').unwrap();
+        let (table_name, key) = path.split_once('/').unwrap_or(("DEFAULT", path));
 
         let read_txn = self.db.begin_read().unwrap();
         if let Ok(table) = read_txn.open_table(TableDefinition::<&str, Vec<u8>>::new(table_name)) {
@@ -176,7 +178,7 @@ impl Storage {
             return Some(v);
         }
 
-        let (table_name, key) = path.split_once('/').unwrap();
+        let (table_name, key) = path.split_once('/').unwrap_or(("DEFAULT", path));
         debug!("table_name: {:?}, key: {:?}", table_name, key);
 
         let read_txn = self.db.begin_read().unwrap();
@@ -192,7 +194,7 @@ impl Storage {
     }
 
     pub fn insert(&self, path: &str, value: Vec<u8>) -> Result<Bytes> {
-        let (table_name, key) = path.split_once('/').unwrap();
+        let (table_name, key) = path.split_once('/').unwrap_or(("DEFAULT", path));
         debug!("table_name: {:?}, key: {:?}", table_name, key);
 
         let write_txn = self.db.begin_write().unwrap();
@@ -208,7 +210,7 @@ impl Storage {
     }
 
     pub fn batch(&self, dir_path: &str, kvs: Vec<(String, Option<Vec<u8>>)>) -> Result<()> {
-        let (table_name, prefix) = dir_path.split_once('/').unwrap();
+        let (table_name, prefix) = dir_path.split_once('/').unwrap_or(("DEFAULT", dir_path));
         debug!("table_name: {:?}, prefix: {:?}", table_name, prefix);
 
         let write_txn = self.db.begin_write()?;
@@ -233,7 +235,7 @@ impl Storage {
     }
 
     pub fn remove(&self, path: &str) {
-        let (table_name, key) = path.split_once('/').unwrap();
+        let (table_name, key) = path.split_once('/').unwrap_or(("DEFAULT", path));
 
         let write_txn = self.db.begin_write().unwrap();
         {
@@ -248,7 +250,7 @@ impl Storage {
     }
 
     pub fn cas(&self, path: &str, old: Option<Vec<u8>>, new: Option<Vec<u8>>) -> Result<()> {
-        let (table_name, key) = path.split_once('/').unwrap();
+        let (table_name, key) = path.split_once('/').unwrap_or(("DEFAULT", path));
 
         let write_txn = self.db.begin_write()?;
         {
@@ -279,7 +281,7 @@ impl Storage {
     }
 
     pub fn scan(&self, path: &str, max_num: usize) -> Vec<(String, Bytes)> {
-        let (table_name, prefix) = path.split_once('/').unwrap();
+        let (table_name, prefix) = path.split_once('/').unwrap_or(("DEFAULT", path));
         debug!("scan table_name: {:?}, prefix: {:?}", table_name, prefix);
 
         let read_txn = self.db.begin_read().unwrap();
@@ -309,7 +311,7 @@ impl Storage {
     }
 
     pub fn scan_key(&self, path: &str, max_num: usize) -> Vec<String> {
-        let (table_name, prefix) = path.split_once('/').unwrap();
+        let (table_name, prefix) = path.split_once('/').unwrap_or(("DEFAULT", path));
         debug!(
             "scan_key table_name: {:?}, prefix: {:?}",
             table_name, prefix
