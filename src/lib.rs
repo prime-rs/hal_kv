@@ -20,6 +20,7 @@ pub struct StorageConfig {
     pub cache_max_capacity: Option<u64>,
     pub cache_time_to_live: Option<u64>,
     pub cache_time_to_idle: Option<u64>,
+    pub recover_table_vec: Vec<String>,
 }
 
 impl Default for StorageConfig {
@@ -30,6 +31,7 @@ impl Default for StorageConfig {
             cache_max_capacity: None,
             cache_time_to_live: None,
             cache_time_to_idle: None,
+            recover_table_vec: vec![],
         }
     }
 }
@@ -65,7 +67,7 @@ impl Storage {
                 match cause {
                     RemovalCause::Explicit | RemovalCause::Expired => {
                         if !key.contains("@@/") {
-                            let (tree_name, key) = key.split_once('/').unwrap();
+                            let (tree_name, key) = key.split_once('/').unwrap_or(("DEFAULT", &key));
                             let tree = db_clone.lock().open_tree(tree_name).unwrap();
                             tree.remove(key).unwrap();
                             debug!(
@@ -172,7 +174,7 @@ impl Storage {
             return true;
         }
 
-        let (tree_name, key) = path.split_once('/').unwrap();
+        let (tree_name, key) = path.split_once('/').unwrap_or(("DEFAULT", path));
         let tree = self.db.open_tree(tree_name).unwrap();
         if let Ok(r) = tree.contains_key(key) {
             return r;
@@ -186,7 +188,7 @@ impl Storage {
             return Some(v);
         }
 
-        let (tree_name, key) = path.split_once('/').unwrap();
+        let (tree_name, key) = path.split_once('/').unwrap_or(("DEFAULT", path));
         debug!("tree_name: {:?}, key: {:?}", tree_name, key);
         let tree = self.db.open_tree(tree_name).unwrap();
         if let Ok(Some(v)) = tree.get(key) {
@@ -199,7 +201,7 @@ impl Storage {
     }
 
     pub fn insert(&self, path: &str, value: Vec<u8>) -> Result<Bytes> {
-        let (tree_name, key) = path.split_once('/').unwrap();
+        let (tree_name, key) = path.split_once('/').unwrap_or(("DEFAULT", path));
         debug!("tree_name: {:?}, key: {:?}", tree_name, key);
         let tree = self.db.open_tree(tree_name)?;
         tree.insert(key, value.clone())?;
@@ -209,7 +211,7 @@ impl Storage {
     }
 
     pub fn batch(&self, dir_path: &str, kvs: Vec<(String, Option<Vec<u8>>)>) -> Result<()> {
-        let (tree_name, prefix) = dir_path.split_once('/').unwrap();
+        let (tree_name, prefix) = dir_path.split_once('/').unwrap_or(("DEFAULT", dir_path));
         debug!("tree_name: {:?}, prefix: {:?}", tree_name, prefix);
         let tree = self.db.open_tree(tree_name)?;
         let mut batch = sled::Batch::default();
@@ -229,14 +231,14 @@ impl Storage {
     }
 
     pub fn remove(&self, path: &str) {
-        let (tree_name, key) = path.split_once('/').unwrap();
+        let (tree_name, key) = path.split_once('/').unwrap_or(("DEFAULT", path));
         let tree = self.db.open_tree(tree_name).unwrap();
         tree.remove(key).unwrap();
         self.cache.remove(&ckey(tree_name, key));
     }
 
     pub fn cas(&self, path: &str, old: Option<Vec<u8>>, new: Option<Vec<u8>>) -> Result<()> {
-        let (tree_name, key) = path.split_once('/').unwrap();
+        let (tree_name, key) = path.split_once('/').unwrap_or(("DEFAULT", path));
         let tree = self.db.open_tree(tree_name)?;
         let cas_result = tree.compare_and_swap(key, old, new);
         match cas_result {
@@ -257,7 +259,7 @@ impl Storage {
     }
 
     pub fn scan(&self, path: &str, max_num: usize) -> Vec<(String, Bytes)> {
-        let (tree_name, prefix) = path.split_once('/').unwrap();
+        let (tree_name, prefix) = path.split_once('/').unwrap_or(("DEFAULT", path));
         debug!("tree_name: {:?}, prefix: {:?}", tree_name, prefix);
         let tree = self.db.open_tree(tree_name).unwrap();
         let mut scan = tree.scan_prefix(prefix);
@@ -279,7 +281,7 @@ impl Storage {
     }
 
     pub fn scan_key(&self, path: &str, max_num: usize) -> Vec<String> {
-        let (tree_name, prefix) = path.split_once('/').unwrap();
+        let (tree_name, prefix) = path.split_once('/').unwrap_or(("DEFAULT", path));
         debug!("tree_name: {:?}, prefix: {:?}", tree_name, prefix);
         let tree = self.db.open_tree(tree_name).unwrap();
         let mut scan = tree.scan_prefix(prefix);
