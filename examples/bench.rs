@@ -1,6 +1,7 @@
 use hal_kv::{Storage, StorageConfig};
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let store: Storage = Storage::new(&StorageConfig {
         db_path: "test_bench.db".to_string(),
         cache_time_to_live: Some(1),

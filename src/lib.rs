@@ -5,12 +5,9 @@ use bytes::Bytes;
 use color_eyre::eyre::{eyre, Result};
 use moka::notification::RemovalCause;
 use moka::sync::SegmentedCache;
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use sled::{CompareAndSwapSuccess, Db};
-use tracing::{debug, info, warn};
-
-const SEQUENCE_TREE_NAME: &str = "SEQUENCE";
+use surrealkv::{Options, Store};
+use tracing::debug;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -36,10 +33,10 @@ impl Default for StorageConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Storage {
-    cache: SegmentedCache<String, Bytes>,
-    db: Db,
+    cache: SegmentedCache<Bytes, Bytes>,
+    db: Arc<Store>,
 }
 
 unsafe impl Send for Storage {}
@@ -54,11 +51,13 @@ impl Default for Storage {
 
 impl Storage {
     pub fn new(config: &StorageConfig) -> Self {
-        let db = sled::open(&config.db_path).unwrap();
-        let db_clone = Arc::new(Mutex::new(db.clone()));
+        let mut opts = Options::new();
+        opts.dir = config.db_path.clone().into();
+        let db = Arc::new(Store::new(opts).unwrap());
+        let db_clone = db.clone();
 
         let mut builder = SegmentedCache::builder(config.cache_num_segments)
-            .weigher(|k: &String, v: &Bytes| (k.len() + v.len()) as u32)
+            .weigher(|k: &Bytes, v: &Bytes| (k.len() + v.len()) as u32)
             .eviction_listener(move |key, value, cause| {
                 debug!(
                     "eviction event: ({:?},{:?}) , cause: {:?}",
@@ -66,15 +65,16 @@ impl Storage {
                 );
                 match cause {
                     RemovalCause::Explicit | RemovalCause::Expired => {
-                        if !key.contains("@@/") {
-                            let (tree_name, key) = key.split_once('/').unwrap_or(("DEFAULT", &key));
-                            let tree = db_clone.lock().open_tree(tree_name).unwrap();
-                            tree.remove(key).unwrap();
+                        let db_clone = db_clone.clone();
+                        tokio::spawn(async move {
+                            let mut txn = db_clone.begin().unwrap();
+                            txn.delete(&key).unwrap();
                             debug!(
                                 "Evicted event: ({:?},{:?}) , cause: {:?}",
                                 key, value, cause
                             );
-                        }
+                            txn.commit().await.unwrap();
+                        });
                     }
                     _ => {}
                 }
@@ -94,106 +94,41 @@ impl Storage {
         Self { cache, db }
     }
 
-    pub fn recover_root(&self) {
-        self.db.iter().for_each(|r| {
-            if let Ok((k, v)) = r {
-                let key = String::from_utf8_lossy(&k).to_string();
-                debug!("Recover cache for root: {:?}", key);
-                self.cache.insert(key, Bytes::from(v.to_vec()));
-            }
-        });
-    }
-
     pub fn recover(&self, tree_name: &str) {
-        if let Ok(tree) = self.db.open_tree(tree_name) {
-            tree.iter().for_each(|r| {
-                if let Ok((k, v)) = r {
-                    let key = String::from_utf8_lossy(&k);
-                    info!("Recover cache for tree({}): {:?}", tree_name, key);
-                    self.cache
-                        .insert(ckey(tree_name, &key), Bytes::from(v.to_vec()));
-                }
-            });
-        }
+        let txn = self.db.begin().unwrap();
+        let iter = txn.scan(tree_name.as_bytes().., None).unwrap();
+        iter.iter().for_each(|(k, v, _, _)| {
+            self.cache
+                .insert(Bytes::from(k.to_vec()), Bytes::from(v.to_vec()));
+        });
     }
 
     pub fn run_pending_tasks(&self) {
         self.cache.run_pending_tasks();
-        self.db.flush().unwrap();
     }
-}
-
-// SEQUENCE
-impl Storage {
-    pub fn next(&self, name: &str) -> u32 {
-        let tree = self.db.open_tree(SEQUENCE_TREE_NAME).unwrap();
-        match tree.get(name).ok().and_then(|v| {
-            v.and_then(|v| match v.to_vec().try_into() {
-                Ok(v) => Some(u32::from_be_bytes(v)),
-                Err(_) => None,
-            })
-        }) {
-            Some(next) => {
-                if tree.insert(name, (next + 1).to_be_bytes().to_vec()).is_ok() {
-                    next + 1
-                } else {
-                    0
-                }
-            }
-            None => {
-                if tree.insert(name, 1u32.to_be_bytes().to_vec()).is_ok() {
-                    1
-                } else {
-                    0
-                }
-            }
-        }
-    }
-
-    pub fn current(&self, name: &str) -> u32 {
-        let tree = self.db.open_tree(SEQUENCE_TREE_NAME).unwrap();
-        if let Ok(Some(v)) = tree.get(name) {
-            if let Ok(v) = v.to_vec().try_into() {
-                return u32::from_be_bytes(v);
-            }
-        }
-        0
-    }
-}
-
-// key in cache
-fn ckey(tree_name: &str, key: &str) -> String {
-    let ckey = format!("{}/{}", tree_name, key);
-    ckey
 }
 
 // structured data
 impl Storage {
     pub fn contains_key(&self, path: &str) -> bool {
-        if self.cache.contains_key(path) {
+        if self.cache.contains_key(path.as_bytes()) {
             return true;
         }
 
-        let (tree_name, key) = path.split_once('/').unwrap_or(("DEFAULT", path));
-        let tree = self.db.open_tree(tree_name).unwrap();
-        if let Ok(r) = tree.contains_key(key) {
-            return r;
-        }
-
-        false
+        let txn = self.db.begin().unwrap();
+        txn.get(path.as_bytes()).is_ok()
     }
 
     pub fn get(&self, path: &str) -> Option<Bytes> {
-        if let Some(v) = self.cache.get(path) {
+        let key: Bytes = path.as_bytes().to_vec().into();
+        if let Some(v) = self.cache.get(&key) {
             return Some(v);
         }
 
-        let (tree_name, key) = path.split_once('/').unwrap_or(("DEFAULT", path));
-        debug!("tree_name: {:?}, key: {:?}", tree_name, key);
-        let tree = self.db.open_tree(tree_name).unwrap();
-        if let Ok(Some(v)) = tree.get(key) {
+        let txn = self.db.begin().unwrap();
+        if let Ok(Some(v)) = txn.get(&key) {
             let value = Bytes::from(v.to_vec());
-            self.cache.insert(ckey(tree_name, key), value.clone());
+            self.cache.insert(key, value.clone());
             return Some(value);
         }
 
@@ -201,121 +136,90 @@ impl Storage {
     }
 
     pub fn insert(&self, path: &str, value: Vec<u8>) -> Result<Bytes> {
-        let (tree_name, key) = path.split_once('/').unwrap_or(("DEFAULT", path));
-        debug!("tree_name: {:?}, key: {:?}", tree_name, key);
-        let tree = self.db.open_tree(tree_name)?;
-        tree.insert(key, value.clone())?;
+        let key: Bytes = path.as_bytes().to_vec().into();
+        let mut txn = self.db.begin()?;
+        txn.set(&key, &value.clone())?;
         let value = Bytes::from(value);
-        self.cache.insert(ckey(tree_name, key), value.clone());
+        self.cache.insert(key, value.clone());
         Ok(value)
     }
 
-    pub fn batch(&self, dir_path: &str, kvs: Vec<(String, Option<Vec<u8>>)>) -> Result<()> {
-        let (tree_name, prefix) = dir_path.split_once('/').unwrap_or(("DEFAULT", dir_path));
-        debug!("tree_name: {:?}, prefix: {:?}", tree_name, prefix);
-        let tree = self.db.open_tree(tree_name)?;
-        let mut batch = sled::Batch::default();
+    pub async fn batch(&self, prefix: &str, kvs: Vec<(String, Option<Vec<u8>>)>) -> Result<()> {
+        let mut txn = self.db.begin()?;
         for (k, v) in kvs {
-            let k = &format!("{}/{}", prefix, k);
+            let k: Bytes = format!("{}/{}", prefix, k).as_bytes().to_vec().into();
             if let Some(v) = v {
-                batch.insert(k.clone(), v.clone());
+                txn.set(&k, &v).ok();
                 let value = Bytes::from(v);
-                self.cache.insert(ckey(tree_name, k), value);
+                self.cache.insert(k, value);
             } else {
-                self.cache.remove(&ckey(tree_name, k));
-                batch.remove(k);
+                self.cache.remove(&k);
+                txn.delete(&k).ok();
             }
         }
-        tree.apply_batch(batch)?;
+        txn.commit().await?;
         Ok(())
     }
 
-    pub fn remove(&self, path: &str) {
-        let (tree_name, key) = path.split_once('/').unwrap_or(("DEFAULT", path));
-        let tree = self.db.open_tree(tree_name).unwrap();
-        tree.remove(key).unwrap();
-        self.cache.remove(&ckey(tree_name, key));
+    pub async fn remove(&self, path: &str) {
+        let key = path.as_bytes();
+        let mut txn = self.db.begin().unwrap();
+        txn.delete(key).unwrap();
+        txn.commit().await.unwrap();
+        self.cache.remove(key);
     }
 
-    pub fn cas(&self, path: &str, old: Option<Vec<u8>>, new: Option<Vec<u8>>) -> Result<()> {
-        let (tree_name, key) = path.split_once('/').unwrap_or(("DEFAULT", path));
-        let tree = self.db.open_tree(tree_name)?;
-        let cas_result = tree.compare_and_swap(key, old, new);
-        match cas_result {
-            Ok(Ok(CompareAndSwapSuccess { new_value, .. })) => match new_value {
+    pub async fn cas(&self, path: &str, old: Option<Vec<u8>>, new: Option<Vec<u8>>) -> Result<()> {
+        let key: Bytes = path.as_bytes().to_vec().into();
+        let mut txn = self.db.begin()?;
+        let current = txn.get(&key)?;
+        if current != old {
+            return Err(eyre!("cas failed"));
+        } else {
+            match new {
                 Some(new) => {
-                    self.cache
-                        .insert(ckey(tree_name, key), Bytes::from(new.to_vec()));
+                    txn.set(&key, &new)?;
                 }
                 None => {
-                    self.cache.remove(&ckey(tree_name, key));
+                    txn.delete(&key)?;
                 }
-            },
-            _ => {
-                return Err(eyre!("cas failed"));
             }
+            txn.commit().await?;
         }
         Ok(())
     }
 
     pub fn scan(&self, path: &str, max_num: usize) -> Vec<(String, Bytes)> {
-        let (tree_name, prefix) = path.split_once('/').unwrap_or(("DEFAULT", path));
-        debug!("tree_name: {:?}, prefix: {:?}", tree_name, prefix);
-        let tree = self.db.open_tree(tree_name).unwrap();
-        let mut scan = tree.scan_prefix(prefix);
+        let txn = self.db.begin().unwrap();
         let mut r = vec![];
-        for _ in 0..max_num {
-            match scan.next() {
-                Some(Ok((k, v))) => r.push((
-                    String::from_utf8_lossy(&k).to_string(),
-                    Bytes::from(v.to_vec()),
-                )),
-                Some(Err(e)) => {
-                    warn!("sled scan error: {:?}", e);
-                    break;
-                }
-                _ => break,
-            }
+        if let Ok(results) = txn.scan(path.as_bytes().., Some(max_num)) {
+            r = results
+                .iter()
+                .map(|(k, v, _, _)| {
+                    (
+                        String::from_utf8_lossy(k).to_string(),
+                        Bytes::from(v.to_vec()),
+                    )
+                })
+                .collect();
         }
         r
     }
 
     pub fn scan_key(&self, path: &str, max_num: usize) -> Vec<String> {
-        let (tree_name, prefix) = path.split_once('/').unwrap_or(("DEFAULT", path));
-        debug!("tree_name: {:?}, prefix: {:?}", tree_name, prefix);
-        let tree = self.db.open_tree(tree_name).unwrap();
-        let mut scan = tree.scan_prefix(prefix);
+        let txn = self.db.begin().unwrap();
         let mut r = vec![];
-        for _ in 0..max_num {
-            match scan.next() {
-                Some(Ok((k, _))) => r.push(String::from_utf8_lossy(&k).to_string()),
-                Some(Err(e)) => {
-                    warn!("sled scan error: {:?}", e);
-                    break;
-                }
-                _ => break,
+        if let Ok(results) = txn.scan(path.as_bytes().., Some(max_num)) {
+            for (k, _, _, _) in results {
+                r.push(String::from_utf8_lossy(&k).to_string());
             }
         }
         r
     }
 }
 
-#[test]
-fn sequence() {
-    // Re-operation requires replacing db_path or cleaning up db_path
-    let store: Storage = Storage::new(&StorageConfig {
-        db_path: "test_sequence.db".to_string(),
-        ..Default::default()
-    });
-    // The first run starts at 0
-    assert_eq!(0, store.current("test"));
-    for i in 0..100 {
-        assert_eq!(i + 1, store.next("test"));
-    }
-}
-
-#[test]
-fn eviction() {
+#[tokio::test]
+async fn eviction() {
     let store: Storage = Storage::new(&StorageConfig {
         db_path: "test_eviction.db".to_string(),
         cache_time_to_live: Some(1),
@@ -324,37 +228,40 @@ fn eviction() {
         ..Default::default()
     });
     let store_clone = store.clone();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.spawn(async move {
-        for i in 0..10000u32 {
-            store_clone
-                .cache
-                .insert(i.to_string(), Bytes::from(i.to_string()));
-            store_clone
-                .db
-                .insert(i.to_string(), i.to_string().as_bytes())
-                .unwrap();
-        }
-
-        println!("{:?}", store_clone.cache.get(&9999u32.to_string()));
-        println!("{:?}", store_clone.db.get(9999u32.to_string()));
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        println!("{:?}", store.cache.get(&9999u32.to_string()));
-        println!("{:?}", store.db.get(9999u32.to_string()));
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        println!("{:?}", store.cache.get(&9999u32.to_string()));
-        println!("{:?}", store.db.get(9999u32.to_string()));
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        println!("{:?}", store.cache.get(&9999u32.to_string()));
-        println!("{:?}", store.db.get(9999u32.to_string()));
-    });
-    rt.block_on(async {
-        tokio::time::sleep(Duration::from_millis(2000)).await;
-    });
+    {
+        let mut txn = store_clone.db.begin().unwrap();
+        let key: Bytes = b"1".to_vec().into();
+        txn.set(&key, &key).unwrap();
+        store_clone.cache.insert(key.clone(), key);
+        txn.commit().await.unwrap();
+    }
+    {
+        let txn = store_clone.db.begin().unwrap();
+        println!("{:?}", store_clone.cache.get(1u32.to_string().as_bytes()));
+        println!("{:?}", txn.get(1u32.to_string().as_bytes()));
+    }
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    {
+        let txn = store_clone.db.begin().unwrap();
+        println!("{:?}", store_clone.cache.get(1u32.to_string().as_bytes()));
+        println!("{:?}", txn.get(1u32.to_string().as_bytes()));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    {
+        let txn = store_clone.db.begin().unwrap();
+        println!("{:?}", store_clone.cache.get(1u32.to_string().as_bytes()));
+        println!("{:?}", txn.get(1u32.to_string().as_bytes()));
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    {
+        let txn = store_clone.db.begin().unwrap();
+        println!("{:?}", store_clone.cache.get(1u32.to_string().as_bytes()));
+        println!("{:?}", txn.get(1u32.to_string().as_bytes()));
+    }
 }
 
-#[test]
-fn structured() {
+#[tokio::test]
+async fn structured() {
     #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
     struct Test {
         a: u32,
@@ -374,6 +281,6 @@ fn structured() {
     let test_db = store.get("tree_name/test").unwrap_or_default();
     let test_db = serde_json::from_slice::<Test>(&test_db).unwrap();
     assert_eq!(test, test_db);
-    store.remove("tree_name/test");
+    store.remove("tree_name/test").await;
     assert_eq!(None, store.get("tree_name/test"));
 }
