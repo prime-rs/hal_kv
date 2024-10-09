@@ -1,6 +1,6 @@
 [package]
 name = "hal_kv"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["JLer <jlerxky@live.com>"]
 edition = "2021"
 description = "A kv hybrid access layer"
@@ -20,7 +20,7 @@ moka = { version = "0.12", features = ["sync"] }
 parking_lot = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 surrealkv = "0.3"
-tokio = { version = "1.39", features = ["time", "rt-multi-thread", "macros"] }
+tokio = { version = "1.40", features = ["time", "rt-multi-thread", "macros"] }
 tracing = "0.1"
 
 [dev-dependencies]

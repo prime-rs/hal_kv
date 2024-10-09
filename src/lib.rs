@@ -95,7 +95,7 @@ impl Storage {
     }
 
     pub fn recover(&self, tree_name: &str) {
-        let txn = self.db.begin().unwrap();
+        let mut txn = self.db.begin().unwrap();
         let iter = txn.scan(tree_name.as_bytes().., None).unwrap();
         iter.iter().for_each(|(k, v, _, _)| {
             self.cache
@@ -115,7 +115,7 @@ impl Storage {
             return true;
         }
 
-        let txn = self.db.begin().unwrap();
+        let mut txn = self.db.begin().unwrap();
         txn.get(path.as_bytes()).is_ok()
     }
 
@@ -125,7 +125,7 @@ impl Storage {
             return Some(v);
         }
 
-        let txn = self.db.begin().unwrap();
+        let mut txn = self.db.begin().unwrap();
         if let Ok(Some(v)) = txn.get(&key) {
             let value = Bytes::from(v.to_vec());
             self.cache.insert(key, value.clone());
@@ -190,7 +190,7 @@ impl Storage {
     }
 
     pub fn scan(&self, path: &str, max_num: usize) -> Vec<(String, Bytes)> {
-        let txn = self.db.begin().unwrap();
+        let mut txn = self.db.begin().unwrap();
         let mut r = vec![];
         if let Ok(results) = txn.scan(path.as_bytes().., Some(max_num)) {
             r = results
@@ -207,7 +207,7 @@ impl Storage {
     }
 
     pub fn scan_key(&self, path: &str, max_num: usize) -> Vec<String> {
-        let txn = self.db.begin().unwrap();
+        let mut txn = self.db.begin().unwrap();
         let mut r = vec![];
         if let Ok(results) = txn.scan(path.as_bytes().., Some(max_num)) {
             for (k, _, _, _) in results {
@@ -236,25 +236,25 @@ async fn eviction() {
         txn.commit().await.unwrap();
     }
     {
-        let txn = store_clone.db.begin().unwrap();
+        let mut txn = store_clone.db.begin().unwrap();
         println!("{:?}", store_clone.cache.get(1u32.to_string().as_bytes()));
         println!("{:?}", txn.get(1u32.to_string().as_bytes()));
     }
     tokio::time::sleep(Duration::from_millis(700)).await;
     {
-        let txn = store_clone.db.begin().unwrap();
+        let mut txn = store_clone.db.begin().unwrap();
         println!("{:?}", store_clone.cache.get(1u32.to_string().as_bytes()));
         println!("{:?}", txn.get(1u32.to_string().as_bytes()));
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     {
-        let txn = store_clone.db.begin().unwrap();
+        let mut txn = store_clone.db.begin().unwrap();
         println!("{:?}", store_clone.cache.get(1u32.to_string().as_bytes()));
         println!("{:?}", txn.get(1u32.to_string().as_bytes()));
     }
     tokio::time::sleep(Duration::from_millis(10)).await;
     {
-        let txn = store_clone.db.begin().unwrap();
+        let mut txn = store_clone.db.begin().unwrap();
         println!("{:?}", store_clone.cache.get(1u32.to_string().as_bytes()));
         println!("{:?}", txn.get(1u32.to_string().as_bytes()));
     }
