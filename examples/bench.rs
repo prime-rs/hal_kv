@@ -10,13 +10,11 @@ async fn main() {
         ..Default::default()
     });
     let now = std::time::Instant::now();
+    let mut datas = Vec::with_capacity(10000);
     for i in 0..10000u32 {
-        println!("insert: {}", i);
-        store
-            .insert(&format!("test/{}", i), i.to_string().as_bytes().to_vec())
-            .await
-            .unwrap();
+        datas.push((i.to_string(), Some(i.to_string().as_bytes().to_vec())));
     }
+    store.batch("test", datas).await.unwrap();
 
     println!("elapsed: {:?}", now.elapsed());
 }
