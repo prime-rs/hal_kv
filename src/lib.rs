@@ -135,12 +135,13 @@ impl Storage {
         None
     }
 
-    pub fn insert(&self, path: &str, value: Vec<u8>) -> Result<Bytes> {
+    pub async fn insert(&self, path: &str, value: Vec<u8>) -> Result<Bytes> {
         let key: Bytes = path.as_bytes().to_vec().into();
         let mut txn = self.db.begin()?;
         txn.set(&key, &value.clone())?;
         let value = Bytes::from(value);
         self.cache.insert(key, value.clone());
+        txn.commit().await?;
         Ok(value)
     }
 
@@ -277,7 +278,7 @@ async fn structured() {
         b: "test".to_string(),
     };
     let bytes = serde_json::to_vec(&test).unwrap();
-    store.insert("tree_name/test", bytes).ok();
+    store.insert("tree_name/test", bytes).await.ok();
     let test_db = store.get("tree_name/test").unwrap_or_default();
     let test_db = serde_json::from_slice::<Test>(&test_db).unwrap();
     assert_eq!(test, test_db);
