@@ -54,6 +54,7 @@ impl Default for Storage {
 impl Storage {
     pub fn new(config: &StorageConfig) -> Self {
         let db = Arc::new(Database::create(&config.db_path).unwrap());
+
         let db_clone = db.clone();
 
         let mut builder = SegmentedCache::builder(config.cache_num_segments)
@@ -219,7 +220,11 @@ impl Storage {
                 write_txn.open_table(TableDefinition::<&str, Vec<u8>>::new(table_name))?;
 
             for (k, v) in kvs {
-                let k = &format!("{}/{}", prefix, k);
+                let k = if prefix.is_empty() {
+                    &k
+                } else {
+                    &format!("{}/{}", prefix, k)
+                };
                 if let Some(v) = v {
                     table.insert(k.as_str(), v.clone())?;
                     let value = Bytes::from(v);
